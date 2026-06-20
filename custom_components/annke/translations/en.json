@@ -1,0 +1,22 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Set up Annke",
+        "description": "Connect your NVR or camera by IP address. Supports all Annke and Hikvision-compatible devices with ISAPI.",
+        "data": {
+          "host": "IP Address",
+          "username": "Username",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect – check IP address and network",
+      "invalid_auth": "Authentication failed – check username and password"
+    },
+    "abort": {
+      "already_configured": "This device is already configured"
+    }
+  }
+}

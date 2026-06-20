@@ -1,0 +1,10 @@
+{
+  "name": "Annke",
+  "domain": "annke",
+  "documentation": "https://github.com/SwainBlake/annke-hacs",
+  "issue_tracker": "https://github.com/SwainBlake/annke-hacs/issues",
+  "homeassistant": "2024.1.0",
+  "codeowners": ["@SwainBlake"],
+  "iot_class": "local_push",
+  "render_readme": true
+}
