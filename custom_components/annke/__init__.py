@@ -17,10 +17,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         username=entry.data[CONF_USERNAME],
         password=entry.data[CONF_PASSWORD],
     )
-    # First refresh fetches all polled data
+    # Order matters: the fetch is driven entirely by the probed capabilities.
+    # Refreshing first returned device info and zero channels, which left every
+    # channel entity blank until the next poll 30 seconds later.
+    await coordinator.async_probe_capabilities()
     await coordinator.async_config_entry_first_refresh()
-    # Probe capabilities + start alert stream
-    await coordinator.async_setup()
+
+    # Only start the stream once the device has answered — a failed refresh
+    # raises ConfigEntryNotReady and would otherwise leave a thread running
+    # behind a dead config entry.
+    coordinator.start_alert_stream()
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
