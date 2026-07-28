@@ -1,9 +1,8 @@
 """Coordinator for Annke ISAPI integration."""
 from __future__ import annotations
 
-import asyncio
 import logging
-import time
+import threading
 from datetime import timedelta
 from xml.etree import ElementTree as ET
 
@@ -73,14 +72,11 @@ def _has_notification(root, method: str) -> bool:
 # Capability probing
 # ---------------------------------------------------------------------------
 
-def _probe_capabilities_sync(host: str, username: str, password: str) -> dict:
-    auth = HTTPDigestAuth(username, password)
-    s = requests.Session()
-    s.auth = auth
+def _probe_capabilities_sync(session, host: str) -> dict:
 
     def probe(path) -> bool:
         try:
-            r = s.get(f"http://{host}{path}", timeout=5)
+            r = session.get(f"http://{host}{path}", timeout=5)
             return r.status_code == 200
         except Exception:
             return False
@@ -88,7 +84,7 @@ def _probe_capabilities_sync(host: str, username: str, password: str) -> dict:
     # Discover channels from streaming list
     channels = []
     try:
-        r = s.get(f"http://{host}/ISAPI/Streaming/channels", timeout=10)
+        r = session.get(f"http://{host}/ISAPI/Streaming/channels", timeout=10)
         if r.status_code == 200:
             root = ET.fromstring(r.text)
             for ch_el in root:
@@ -138,12 +134,9 @@ def _probe_capabilities_sync(host: str, username: str, password: str) -> dict:
 # Full data fetch
 # ---------------------------------------------------------------------------
 
-def _fetch_all_sync(host: str, username: str, password: str, caps: dict) -> dict:
-    auth = HTTPDigestAuth(username, password)
-    s = requests.Session()
-    s.auth = auth
+def _fetch_all_sync(session, host: str, caps: dict) -> dict:
 
-    dev = _get(s, host, "/ISAPI/System/deviceInfo")
+    dev = _get(session, host, "/ISAPI/System/deviceInfo")
     device_info = {
         "model":    _text(dev, "model",           NS_STD, ""),
         "firmware": _text(dev, "firmwareVersion", NS_STD, ""),
@@ -158,7 +151,7 @@ def _fetch_all_sync(host: str, username: str, password: str, caps: dict) -> dict
     nvr_caps = caps.get("nvr_caps", {})
     if nvr_caps.get("input_proxy"):
         try:
-            proxy = _get(s, host, "/ISAPI/ContentMgmt/InputProxy/channels")
+            proxy = _get(session, host, "/ISAPI/ContentMgmt/InputProxy/channels")
             for ch_el in proxy:
                 id_el = _find(ch_el, "id", NS_STD)
                 if id_el is None:
@@ -179,7 +172,7 @@ def _fetch_all_sync(host: str, username: str, password: str, caps: dict) -> dict
 
 
     if nvr_caps.get("status"):
-        st = _get(s, host, "/ISAPI/System/status")
+        st = _get(session, host, "/ISAPI/System/status")
         cpu_list = _find(st, "CPUList", NS_STD)
         cpu = _find(cpu_list, "CPU", NS_STD) if cpu_list is not None else None
         mem_list = _find(st, "MemoryList", NS_STD)
@@ -190,7 +183,7 @@ def _fetch_all_sync(host: str, username: str, password: str, caps: dict) -> dict
         nvr["uptime_seconds"] = int(_text(st, "deviceUpTime", NS_STD, "0") or 0)
 
     if nvr_caps.get("hdd"):
-        stor = _get(s, host, "/ISAPI/ContentMgmt/Storage")
+        stor = _get(session, host, "/ISAPI/ContentMgmt/Storage")
         hdd_list = _find(stor, "hddList", NS_STD)
         hdd = _find(hdd_list, "hdd", NS_STD) if hdd_list is not None else None
         cap_mb  = int(_text(hdd, "capacity",  NS_STD, "0") or 0)
@@ -203,11 +196,11 @@ def _fetch_all_sync(host: str, username: str, password: str, caps: dict) -> dict
         nvr["hdd_status"]      = _text(hdd, "status", NS_STD, "unknown")
 
     if nvr_caps.get("streaming_status"):
-        ss = _get(s, host, "/ISAPI/Streaming/status")
+        ss = _get(session, host, "/ISAPI/Streaming/status")
         nvr["rtsp_sessions"] = int(_text(ss, "totalStreamingSessions", NS_STD, "0") or 0)
 
     if nvr_caps.get("network"):
-        net = _get(s, host, "/ISAPI/System/Network/interfaces")
+        net = _get(session, host, "/ISAPI/System/Network/interfaces")
         ifaces = list(net)
         if ifaces:
             iface = ifaces[0]
@@ -221,30 +214,30 @@ def _fetch_all_sync(host: str, username: str, password: str, caps: dict) -> dict
         data = {}
 
         if ch_cap.get("motion"):
-            md = _get(s, host, f"/ISAPI/System/Video/inputs/channels/{ch}/motionDetection")
+            md = _get(session, host, f"/ISAPI/System/Video/inputs/channels/{ch}/motionDetection")
             layout = _find(md, "MotionDetectionLayout", NS_ISAPI)
             data["motion_enabled"]     = _bool(_text(md, "enabled", NS_ISAPI))
             data["motion_sensitivity"] = int(_text(layout, "sensitivityLevel", NS_ISAPI, "50") or 50)
 
         if ch_cap.get("tamper"):
-            td = _get(s, host, f"/ISAPI/System/Video/inputs/channels/{ch}/tamperDetection")
+            td = _get(session, host, f"/ISAPI/System/Video/inputs/channels/{ch}/tamperDetection")
             data["tamper_enabled"] = _bool(_text(td, "enabled", NS_ISAPI))
 
         if ch_cap.get("privacy"):
-            pm = _get(s, host, f"/ISAPI/System/Video/inputs/channels/{ch}/privacyMask")
+            pm = _get(session, host, f"/ISAPI/System/Video/inputs/channels/{ch}/privacyMask")
             data["privacy_mask_enabled"] = _bool(_text(pm, "enabled", NS_ISAPI))
 
         if ch_cap.get("vmd_trigger"):
-            vmd = _get(s, host, f"/ISAPI/Event/triggers/VMD-{ch}")
+            vmd = _get(session, host, f"/ISAPI/Event/triggers/VMD-{ch}")
             data["notify_push"]  = _has_notification(vmd, "center")
             data["notify_email"] = _has_notification(vmd, "email")
 
         if ch_cap.get("tamper_trigger"):
-            te = _get(s, host, f"/ISAPI/Event/triggers/tamper-{ch}")
+            te = _get(session, host, f"/ISAPI/Event/triggers/tamper-{ch}")
             data["tamper_notify_push"] = _has_notification(te, "center")
 
         if ch_cap.get("image"):
-            img = _get(s, host, f"/ISAPI/Image/channels/{ch}")
+            img = _get(session, host, f"/ISAPI/Image/channels/{ch}")
             ircut = _find(img, "IrcutFilter",     NS_STD)
             suplt = _find(img, "SupplementLight", NS_STD)
             flip  = _find(img, "ImageFlip",       NS_STD)
@@ -262,14 +255,14 @@ def _fetch_all_sync(host: str, username: str, password: str, caps: dict) -> dict
             data["sharpness"]        = int(_text(sharp, "SharpnessLevel",  NS_STD, "50") or 50)
 
         if ch_cap.get("overlays"):
-            ov = _get(s, host, f"/ISAPI/System/Video/inputs/channels/{ch}/overlays")
+            ov = _get(session, host, f"/ISAPI/System/Video/inputs/channels/{ch}/overlays")
             dt_ov   = _find(ov, "DateTimeOverlay",    NS_STD)
             name_ov = _find(ov, "channelNameOverlay", NS_STD)
             data["osd_datetime"]    = _bool(_text(dt_ov,   "enabled", NS_STD))
             data["osd_channelname"] = _bool(_text(name_ov, "enabled", NS_STD))
 
         try:
-            sc    = _get(s, host, f"/ISAPI/Streaming/channels/{ch * 100 + 1}")
+            sc    = _get(session, host, f"/ISAPI/Streaming/channels/{ch * 100 + 1}")
             video = _find(sc, "Video", NS_STD)
             audio = _find(sc, "Audio", NS_STD)
             sc_el = _find(video, "SmartCodec", NS_STD) if video is not None else None
@@ -285,7 +278,7 @@ def _fetch_all_sync(host: str, username: str, password: str, caps: dict) -> dict
         for feat in SMART_FEATURES:
             if ch_cap.get(feat):
                 try:
-                    sf = _get(s, host, SMART_ENDPOINT[feat].format(ch=ch))
+                    sf = _get(session, host, SMART_ENDPOINT[feat].format(ch=ch))
                     data[f"{feat}_enabled"] = _bool(_text(sf, "enabled", NS_ISAPI))
                     sens = _text(sf, "sensitivityLevel", NS_ISAPI)
                     if sens is not None:
@@ -308,58 +301,48 @@ def _fetch_all_sync(host: str, username: str, password: str, caps: dict) -> dict
 # PUT helpers
 # ---------------------------------------------------------------------------
 
-def _modify_bool_field(host, username, password, path, tag, ns, value: bool):
-    s = requests.Session()
-    s.auth = HTTPDigestAuth(username, password)
-    root = _get(s, host, path)
+def _modify_bool_field(session, host, path, tag, ns, value: bool):
+    root = _get(session, host, path)
     el = root.find(f"{{{ns}}}{tag}")
     if el is not None:
         el.text = "true" if value else "false"
-    _put(s, host, path, root, ns)
+    _put(session, host, path, root, ns)
 
 
-def _modify_nested_bool(host, username, password, path, parent_tag, tag, ns, value: bool):
-    s = requests.Session()
-    s.auth = HTTPDigestAuth(username, password)
-    root = _get(s, host, path)
+def _modify_nested_bool(session, host, path, parent_tag, tag, ns, value: bool):
+    root = _get(session, host, path)
     parent = root.find(f"{{{ns}}}{parent_tag}") if parent_tag else root
     if parent is not None:
         el = parent.find(f"{{{ns}}}{tag}")
         if el is not None:
             el.text = "true" if value else "false"
-    _put(s, host, path, root, ns)
+    _put(session, host, path, root, ns)
 
 
-def _modify_int_field(host, username, password, path, parent_tag, tag, ns, value: int):
-    s = requests.Session()
-    s.auth = HTTPDigestAuth(username, password)
-    root = _get(s, host, path)
+def _modify_int_field(session, host, path, parent_tag, tag, ns, value: int):
+    root = _get(session, host, path)
     parent = root.find(f"{{{ns}}}{parent_tag}") if parent_tag else root
     if parent is None:
         parent = root
     el = parent.find(f"{{{ns}}}{tag}")
     if el is not None:
         el.text = str(value)
-    _put(s, host, path, root, ns)
+    _put(session, host, path, root, ns)
 
 
-def _modify_text_field(host, username, password, path, parent_tag, tag, ns, value: str):
-    s = requests.Session()
-    s.auth = HTTPDigestAuth(username, password)
-    root = _get(s, host, path)
+def _modify_text_field(session, host, path, parent_tag, tag, ns, value: str):
+    root = _get(session, host, path)
     parent = root.find(f"{{{ns}}}{parent_tag}") if parent_tag else root
     if parent is None:
         parent = root
     el = parent.find(f"{{{ns}}}{tag}")
     if el is not None:
         el.text = value
-    _put(s, host, path, root, ns)
+    _put(session, host, path, root, ns)
 
 
-def _toggle_notification(host, username, password, url_path, method: str, enabled: bool):
-    s = requests.Session()
-    s.auth = HTTPDigestAuth(username, password)
-    root = _get(s, host, url_path)
+def _toggle_notification(session, host, url_path, method: str, enabled: bool):
+    root = _get(session, host, url_path)
     notif_list = root.find(f"{{{NS_ISAPI}}}EventTriggerNotificationList")
     if notif_list is None:
         return
@@ -377,14 +360,12 @@ def _toggle_notification(host, username, password, url_path, method: str, enable
         notif_list.remove(existing)
     else:
         return
-    _put(s, host, url_path, root, NS_ISAPI)
+    _put(session, host, url_path, root, NS_ISAPI)
 
 
-def _set_smart_codec_sync(host, username, password, ch, value: bool):
-    s = requests.Session()
-    s.auth = HTTPDigestAuth(username, password)
+def _set_smart_codec_sync(session, host, ch, value: bool):
     path = f"/ISAPI/Streaming/channels/{ch * 100 + 1}"
-    root = _get(s, host, path)
+    root = _get(session, host, path)
     video = root.find(f"{{{NS_STD}}}Video")
     if video is not None:
         sc = video.find(f"{{{NS_STD}}}SmartCodec")
@@ -392,58 +373,61 @@ def _set_smart_codec_sync(host, username, password, ch, value: bool):
             el = sc.find(f"{{{NS_STD}}}enabled")
             if el is not None:
                 el.text = "true" if value else "false"
-    _put(s, host, path, root, NS_STD)
+    _put(session, host, path, root, NS_STD)
 
 
-def _set_wdr_enabled_sync(host, username, password, ch, value: bool):
-    s = requests.Session()
-    s.auth = HTTPDigestAuth(username, password)
+def _set_wdr_enabled_sync(session, host, ch, value: bool):
     path = f"/ISAPI/Image/channels/{ch}"
-    root = _get(s, host, path)
+    root = _get(session, host, path)
     wdr = root.find(f"{{{NS_STD}}}WDR")
     if wdr is not None:
         el = wdr.find(f"{{{NS_STD}}}mode")
         if el is not None:
             el.text = "open" if value else "close"
-    _put(s, host, path, root, NS_STD)
+    _put(session, host, path, root, NS_STD)
 
 
-def _set_osd_datetime_sync(host, username, password, ch, value: bool):
-    s = requests.Session()
-    s.auth = HTTPDigestAuth(username, password)
+def _set_osd_datetime_sync(session, host, ch, value: bool):
     path = f"/ISAPI/System/Video/inputs/channels/{ch}/overlays"
-    root = _get(s, host, path)
+    root = _get(session, host, path)
     dt_ov = root.find(f"{{{NS_STD}}}DateTimeOverlay")
     if dt_ov is not None:
         el = dt_ov.find(f"{{{NS_STD}}}enabled")
         if el is not None:
             el.text = "true" if value else "false"
-    _put(s, host, path, root, NS_STD)
+    _put(session, host, path, root, NS_STD)
 
 
-def _set_osd_channelname_sync(host, username, password, ch, value: bool):
-    s = requests.Session()
-    s.auth = HTTPDigestAuth(username, password)
+def _set_osd_channelname_sync(session, host, ch, value: bool):
     path = f"/ISAPI/System/Video/inputs/channels/{ch}/overlays"
-    root = _get(s, host, path)
+    root = _get(session, host, path)
     name_ov = root.find(f"{{{NS_STD}}}channelNameOverlay")
     if name_ov is not None:
         el = name_ov.find(f"{{{NS_STD}}}enabled")
         if el is not None:
             el.text = "true" if value else "false"
-    _put(s, host, path, root, NS_STD)
+    _put(session, host, path, root, NS_STD)
 
 
 # ---------------------------------------------------------------------------
 # Alert stream reader
 # ---------------------------------------------------------------------------
 
-def _read_alert_stream_sync(host, username, password, on_event, stop_event):
-    auth = HTTPDigestAuth(username, password)
+def _read_alert_stream_sync(session, host, on_event, stop_event):
+    """Long-lived reader for the ISAPI alert stream.
+
+    Runs on a dedicated thread, not on the Home Assistant executor pool: this
+    loop never returns while the integration is loaded, and permanently holding
+    a pool thread would starve other integrations.
+
+    The read timeout is what bounds shutdown latency — the loop can only notice
+    `stop_event` between chunks, so a long timeout would keep the thread alive
+    well past unload.
+    """
     url = f"http://{host}/ISAPI/Event/notification/alertStream"
     while not stop_event.is_set():
         try:
-            with requests.get(url, auth=auth, stream=True, timeout=60) as resp:
+            with session.get(url, stream=True, timeout=(10, 30)) as resp:
                 resp.raise_for_status()
                 buf = b""
                 for chunk in resp.iter_content(chunk_size=512):
@@ -468,7 +452,8 @@ def _read_alert_stream_sync(host, username, password, on_event, stop_event):
         except Exception as exc:
             if not stop_event.is_set():
                 _LOGGER.debug("Alert stream disconnected (%s), reconnecting in 5s", exc)
-                time.sleep(5)
+                # wait() instead of sleep(): returns immediately on shutdown
+                stop_event.wait(5)
 
 
 # ---------------------------------------------------------------------------
@@ -490,30 +475,44 @@ class AnnkeCoordinator(DataUpdateCoordinator):
         self.capabilities: dict = {}
         self.alert_state: dict[int, dict[str, bool]] = {}
         self.nvr_alert: dict[str, bool] = {}
-        self._alert_stop = asyncio.Event()
-        self._alert_task = None
+        self._alert_stop = threading.Event()
+        self._alert_thread: threading.Thread | None = None
         self._alert_listeners: list = []
 
-    async def async_setup(self) -> None:
+        # One session for polling and writes, a separate one for the alert
+        # stream. Reusing a session keeps the digest handshake and the TCP
+        # connection alive; a fresh session per call doubled the round trips.
+        # requests' HTTPDigestAuth keeps its state thread-local, so sharing the
+        # polling session between the executor jobs is safe. The alert stream
+        # gets its own because it holds a connection open indefinitely.
+        auth = HTTPDigestAuth(username, password)
+        self.session = requests.Session()
+        self.session.auth = auth
+        self._alert_session = requests.Session()
+        self._alert_session.auth = HTTPDigestAuth(username, password)
+
+    async def async_probe_capabilities(self) -> None:
+        """Find out what this device actually supports.
+
+        Must run before the first refresh — the fetch is driven entirely by
+        these capabilities and returns no channels at all without them.
+        """
         self.capabilities = await self.hass.async_add_executor_job(
-            _probe_capabilities_sync, self.host, self.username, self.password
+            _probe_capabilities_sync, self.session, self.host
         )
         for ch in self.capabilities.get("channels", []):
             self.alert_state[ch] = {k: False for k in EVENT_TYPE_KEY.values() if k not in ("disk_full", "disk_error")}
         self.nvr_alert = {"disk_full": False, "disk_error": False}
-        self._start_alert_stream()
 
-    def _start_alert_stream(self) -> None:
+    def start_alert_stream(self) -> None:
         self._alert_stop.clear()
-        self._alert_task = self.hass.loop.run_in_executor(
-            None,
-            _read_alert_stream_sync,
-            self.host,
-            self.username,
-            self.password,
-            self._on_alert_event,
-            self._alert_stop,
+        self._alert_thread = threading.Thread(
+            target=_read_alert_stream_sync,
+            args=(self._alert_session, self.host, self._on_alert_event, self._alert_stop),
+            name=f"{DOMAIN}-alertstream-{self.host}",
+            daemon=True,
         )
+        self._alert_thread.start()
 
     def _on_alert_event(self, channel: int, event_type: str, active: bool) -> None:
         key = EVENT_TYPE_KEY.get(event_type)
@@ -539,17 +538,31 @@ class AnnkeCoordinator(DataUpdateCoordinator):
 
     async def async_shutdown(self) -> None:
         self._alert_stop.set()
+        thread = self._alert_thread
+        if thread is not None and thread.is_alive():
+            # Bounded by the stream read timeout; join so the connection is
+            # actually gone before the sessions are closed.
+            await self.hass.async_add_executor_job(thread.join, 35)
+            if thread.is_alive():
+                _LOGGER.warning("Alert stream thread did not stop within 35s")
+        self._alert_thread = None
+
+        # super() cancels the scheduled refresh — skipping it left a timer behind.
+        await super().async_shutdown()
+
+        await self.hass.async_add_executor_job(self.session.close)
+        await self.hass.async_add_executor_job(self._alert_session.close)
 
     async def _async_update_data(self) -> dict:
         try:
             return await self.hass.async_add_executor_job(
-                _fetch_all_sync, self.host, self.username, self.password, self.capabilities
+                _fetch_all_sync, self.session, self.host, self.capabilities
             )
         except Exception as err:
             raise UpdateFailed(f"Error communicating with device: {err}") from err
 
     async def _call(self, fn, *args):
-        await self.hass.async_add_executor_job(fn, self.host, self.username, self.password, *args)
+        await self.hass.async_add_executor_job(fn, self.session, self.host, *args)
         await self.async_request_refresh()
 
     # Motion

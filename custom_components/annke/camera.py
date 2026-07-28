@@ -1,8 +1,7 @@
 """Camera platform – snapshot via ISAPI, RTSP URL as attribute."""
 from __future__ import annotations
 
-import requests
-from requests.auth import HTTPDigestAuth
+import logging
 
 from homeassistant.components.camera import Camera
 from homeassistant.config_entries import ConfigEntry
@@ -12,6 +11,8 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .const import DOMAIN, RTSP_PORT
 from .coordinator import AnnkeCoordinator
 from .entity import AnnkeChannelEntity
+
+_LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(
@@ -26,13 +27,14 @@ async def async_setup_entry(
     async_add_entities(entities)
 
 
-def _fetch_snapshot_sync(host, username, password, channel) -> bytes | None:
+def _fetch_snapshot_sync(session, host, channel) -> bytes | None:
     url = f"http://{host}/ISAPI/Streaming/channels/{channel * 100 + 1}/picture"
     try:
-        r = requests.get(url, auth=HTTPDigestAuth(username, password), timeout=15)
+        r = session.get(url, timeout=15)
         r.raise_for_status()
         return r.content
-    except Exception:
+    except Exception as exc:
+        _LOGGER.debug("Snapshot for channel %s failed: %s", channel, exc)
         return None
 
 
@@ -58,8 +60,7 @@ class AnnkeCameraEntity(AnnkeChannelEntity, Camera):
     ) -> bytes | None:
         return await self.hass.async_add_executor_job(
             _fetch_snapshot_sync,
+            self.coordinator.session,
             self.coordinator.host,
-            self.coordinator.username,
-            self.coordinator.password,
             self._channel,
         )
