@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import socket
 import threading
 from datetime import timedelta
 from xml.etree import ElementTree as ET
@@ -23,6 +24,11 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# Grace period for the alert stream thread after its connection was closed.
+# Deliberately short: the connection is already gone at that point, so this
+# only covers the thread unwinding, not a read that is still running.
+ALERT_STREAM_JOIN_TIMEOUT = 5
 
 
 # ---------------------------------------------------------------------------
@@ -413,22 +419,35 @@ def _set_osd_channelname_sync(session, host, ch, value: bool):
 # Alert stream reader
 # ---------------------------------------------------------------------------
 
-def _read_alert_stream_sync(session, host, on_event, stop_event):
+def _read_alert_stream_sync(session, host, on_event, stop_event, publish_response=None):
     """Long-lived reader for the ISAPI alert stream.
 
     Runs on a dedicated thread, not on the Home Assistant executor pool: this
     loop never returns while the integration is loaded, and permanently holding
     a pool thread would starve other integrations.
 
-    The read timeout is what bounds shutdown latency — the loop can only notice
-    `stop_event` between chunks, so a long timeout would keep the thread alive
-    well past unload.
+    Two things bound how long this thread survives an unload:
+
+    * the read timeout, which is the fallback — the loop can only notice
+      `stop_event` between chunks, so a long timeout would keep the thread
+      alive well past unload;
+    * `publish_response`, which hands the live response to the coordinator so
+      that shutdown can close the socket underneath this loop instead of
+      waiting out the timeout. The blocked read then fails immediately, the
+      exception is swallowed below and the loop leaves through `stop_event`.
     """
     url = f"http://{host}/ISAPI/Event/notification/alertStream"
     while not stop_event.is_set():
         try:
             with session.get(url, stream=True, timeout=(10, 30)) as resp:
                 resp.raise_for_status()
+                if publish_response is not None:
+                    publish_response(resp)
+                    # The response only became reachable for the closer now, so
+                    # re-check: a stop between the request and this point would
+                    # otherwise be missed and the read would block again.
+                    if stop_event.is_set():
+                        break
                 buf = b""
                 for chunk in resp.iter_content(chunk_size=512):
                     if stop_event.is_set():
@@ -454,6 +473,9 @@ def _read_alert_stream_sync(session, host, on_event, stop_event):
                 _LOGGER.debug("Alert stream disconnected (%s), reconnecting in 5s", exc)
                 # wait() instead of sleep(): returns immediately on shutdown
                 stop_event.wait(5)
+        finally:
+            if publish_response is not None:
+                publish_response(None)
 
 
 # ---------------------------------------------------------------------------
@@ -477,6 +499,8 @@ class AnnkeCoordinator(DataUpdateCoordinator):
         self.nvr_alert: dict[str, bool] = {}
         self._alert_stop = threading.Event()
         self._alert_thread: threading.Thread | None = None
+        self._alert_response = None
+        self._alert_response_lock = threading.Lock()
         self._alert_listeners: list = []
 
         # One session for polling and writes, a separate one for the alert
@@ -508,11 +532,62 @@ class AnnkeCoordinator(DataUpdateCoordinator):
         self._alert_stop.clear()
         self._alert_thread = threading.Thread(
             target=_read_alert_stream_sync,
-            args=(self._alert_session, self.host, self._on_alert_event, self._alert_stop),
+            args=(
+                self._alert_session,
+                self.host,
+                self._on_alert_event,
+                self._alert_stop,
+                self._publish_alert_response,
+            ),
             name=f"{DOMAIN}-alertstream-{self.host}",
             daemon=True,
         )
         self._alert_thread.start()
+
+    def _publish_alert_response(self, response) -> None:
+        """Record the response the reader thread is currently blocked on.
+
+        Called from the reader thread, read from the event loop during
+        shutdown, hence the lock.
+        """
+        with self._alert_response_lock:
+            self._alert_response = response
+
+    def _abort_alert_stream(self) -> None:
+        """Tear down the open alert connection so the blocked read returns now.
+
+        Runs in the executor. Without this the reader only notices the stop
+        flag after the next chunk or the read timeout, up to 30 seconds later,
+        and shutdown waited that out.
+
+        `shutdown()` before `close()` is the point: a bare close leaves a read
+        that is already blocked in the socket sitting there, because the file
+        descriptor stays alive until the reading thread lets go of it.
+        Shutting the socket down delivers an immediate end of file instead, so
+        the read returns on the spot. Close alone would only help for the next
+        pass through the loop.
+        """
+        with self._alert_response_lock:
+            response = self._alert_response
+            self._alert_response = None
+        if response is None:
+            return
+        try:
+            raw = getattr(response, "raw", None)
+            # urllib3 renamed the attribute between 1.x and 2.x
+            conn = getattr(raw, "_connection", None) or getattr(raw, "connection", None)
+            sock = getattr(conn, "sock", None)
+            if sock is not None:
+                sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            # already gone, which is the outcome we wanted anyway
+            pass
+        except Exception as exc:  # noqa: BLE001 - shutdown must never raise here
+            _LOGGER.debug("Could not shut down the alert stream socket: %s", exc)
+        try:
+            response.close()
+        except Exception as exc:  # noqa: BLE001 - closing must never raise here
+            _LOGGER.debug("Closing the alert stream response failed: %s", exc)
 
     def _on_alert_event(self, channel: int, event_type: str, active: bool) -> None:
         key = EVENT_TYPE_KEY.get(event_type)
@@ -540,11 +615,21 @@ class AnnkeCoordinator(DataUpdateCoordinator):
         self._alert_stop.set()
         thread = self._alert_thread
         if thread is not None and thread.is_alive():
-            # Bounded by the stream read timeout; join so the connection is
-            # actually gone before the sessions are closed.
-            await self.hass.async_add_executor_job(thread.join, 35)
+            # Tear the connection down instead of waiting for the read to time
+            # out. Waiting was the whole problem: the join ran as an executor
+            # job, so a silent stream held a pool thread for up to 35 seconds
+            # and Home Assistant ran into its own shutdown deadline
+            # ("Thread[SyncWorker_*] is still running at shutdown").
+            await self.hass.async_add_executor_job(self._abort_alert_stream)
+            # Short grace period only, so the sessions are not closed out from
+            # under a thread that is still unwinding. The thread is a daemon:
+            # if it overruns even this, it cannot keep the process alive.
+            await self.hass.async_add_executor_job(thread.join, ALERT_STREAM_JOIN_TIMEOUT)
             if thread.is_alive():
-                _LOGGER.warning("Alert stream thread did not stop within 35s")
+                _LOGGER.debug(
+                    "Alert stream thread still unwinding after %ss, leaving it to the daemon flag",
+                    ALERT_STREAM_JOIN_TIMEOUT,
+                )
         self._alert_thread = None
 
         # super() cancels the scheduled refresh — skipping it left a timer behind.

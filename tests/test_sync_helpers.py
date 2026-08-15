@@ -149,6 +149,11 @@ ALERT = (
 
 puts = []
 
+# When switched on, the alert stream sends its one event and then says nothing
+# more. That is the case the shutdown path has to survive: the reader sits in a
+# blocking read and only the socket going away can free it before the timeout.
+silent_stream = {"on": False}
+
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -170,6 +175,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
             self._chunk(ALERT.encode())
+            if silent_stream["on"]:
+                time.sleep(45)  # well past the reader's 30s read timeout
+                return
             # keepalives so the reader loop can notice its stop flag quickly
             for _ in range(100):
                 time.sleep(0.1)
@@ -261,6 +269,37 @@ def main():
     stop.set()
     thread.join(5)
     check("thread stops promptly on the stop flag", not thread.is_alive())
+
+    # --- shutdown aborts a blocked read instead of waiting out the timeout --
+    # Without the abort this thread would hang on the read for 30 seconds, so
+    # the join below is what makes the difference visible.
+    silent_stream["on"] = True
+    stop2 = threading.Event()
+    # DataUpdateCoordinator is stubbed out above, so the real class can be
+    # built here without a Home Assistant instance.
+    coordinator = co.AnnkeCoordinator(None, host, "admin", "secret")
+    thread2 = threading.Thread(
+        target=co._read_alert_stream_sync,
+        args=(requests.Session(), host, lambda c, t, a: None, stop2,
+              coordinator._publish_alert_response),
+        daemon=True,
+    )
+    thread2.start()
+    deadline = time.time() + 5
+    while coordinator._alert_response is None and time.time() < deadline:
+        time.sleep(0.05)
+    check("the reader hands its live response to the coordinator",
+          coordinator._alert_response is not None)
+
+    stop2.set()
+    started = time.time()
+    coordinator._abort_alert_stream()
+    thread2.join(10)
+    elapsed = time.time() - started
+    check("closing the socket ends the blocked read at once",
+          not thread2.is_alive() and elapsed < 5, f"{elapsed:.1f}s")
+    check("the coordinator no longer holds a response afterwards",
+          coordinator._alert_response is None)
 
     srv.shutdown()
     print(f"\n{passed}/{passed + failed} passed")
