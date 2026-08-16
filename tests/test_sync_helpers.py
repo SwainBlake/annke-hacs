@@ -74,8 +74,8 @@ def check(name, cond, detail=""):
 
 # --- Fake device ------------------------------------------------------------
 
-def _std(body):
-    return f'<?xml version="1.0" encoding="UTF-8"?><root xmlns="{NS_STD}">{body}</root>'
+def _std(body, tag="root"):
+    return f'<?xml version="1.0" encoding="UTF-8"?><{tag} xmlns="{NS_STD}">{body}</{tag}>'
 
 
 def _isapi(tag, body):
@@ -100,6 +100,9 @@ ROUTES = {
     "/ISAPI/System/Network/interfaces": _std(
         "<NetworkInterface><IPAddress><ipAddress>192.168.1.9</ipAddress></IPAddress>"
         "<MACAddress><macAddress>aa:bb:cc:dd:ee:ff</macAddress></MACAddress></NetworkInterface>"),
+    # Wanduhr mit dem falschen Versatz, den das echte Geraet am 2026-08-16
+    # geliefert hat: +01:00 waehrend die Uhr auf Sommerzeit lief.
+    "/ISAPI/System/time/localTime": "2026-08-16T15:25:42+01:00",
     "/ISAPI/ContentMgmt/InputProxy/channels": _std(
         "<InputProxyChannel><id>1</id><name>Einfahrt</name>"
         "<sourceInputPortDescriptor><model>C800</model><serialNumber>CAM1</serialNumber>"
@@ -153,6 +156,9 @@ puts = []
 # more. That is the case the shutdown path has to survive: the reader sits in a
 # blocking read and only the socket going away can free it before the timeout.
 silent_stream = {"on": False}
+posts = []
+# Steuert, wie das Geraet auf die Aufzeichnungssuche antwortet.
+search_mode = {"on": "normal", "stumm": set(), "starts": {}}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -199,6 +205,32 @@ class Handler(BaseHTTPRequestHandler):
         puts.append((self.path, self.rfile.read(length).decode()))
         self._body("<ResponseStatus/>")
 
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        payload = self.rfile.read(length).decode()
+        if self.path != "/ISAPI/ContentMgmt/search":
+            return self._body("not found", 404)
+        posts.append(payload)
+        if search_mode["on"] == "kaputt":
+            return self._body("<ResponseStatus/>", 500)
+        track = "101"
+        if "<trackID>" in payload:
+            track = payload.split("<trackID>")[1].split("</trackID>")[0]
+        if search_mode["on"] == "leer" or track in search_mode["stumm"]:
+            return self._body(_std(
+                "<responseStatus>true</responseStatus>"
+                "<responseStatusStrg>NO MATCHES</responseStatusStrg>"
+                "<numOfMatches>0</numOfMatches><matchList/>", tag="CMSearchResult"))
+        start = search_mode["starts"].get(track, "2026-08-01T16:21:50Z")
+        return self._body(_std(
+            "<responseStatus>true</responseStatus>"
+            "<responseStatusStrg>MORE</responseStatusStrg>"
+            "<numOfMatches>397</numOfMatches><matchList>"
+            f"<searchMatchItem><trackID>{track}</trackID><timeSpan>"
+            f"<startTime>{start}</startTime>"
+            "<endTime>2026-08-01T17:09:40Z</endTime></timeSpan>"
+            "</searchMatchItem></matchList>", tag="CMSearchResult"))
+
 
 def main():
     srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -214,6 +246,52 @@ def main():
     check("probing marks absent features as unsupported",
           caps["channel_caps"][1]["face_detection"] is False)
     check("probing detects NVR endpoints", caps["nvr_caps"]["hdd"] and caps["nvr_caps"]["status"])
+    check("probing detects the recording search", caps["nvr_caps"]["recording_search"] is True,
+          caps["nvr_caps"].get("recording_search"))
+
+    # --- Reichweite des Ringpuffers (F-142/F-160) ---------------------------
+    # Die Wanduhr wird ohne den Versatz gelesen, weil der Rekorder bei
+    # Sommerzeit einen falschen Versatz meldet.
+    check("wall clock ignores the wrong UTC offset",
+          co._wall_clock("2026-08-16T15:25:42+01:00").isoformat() == "2026-08-16T15:25:42",
+          co._wall_clock("2026-08-16T15:25:42+01:00"))
+
+    posts.clear()
+    reach = co._fetch_recording_reach_sync(session, host, [101])
+    # 2026-08-01T16:21:50 bis 2026-08-16T15:25:42 sind 14 Tage 23:03:52 = 14,96 d
+    check("measures the ring buffer reach", reach.get("recording_reach_days") == 14.96, reach)
+    check("names the oldest segment",
+          reach.get("recording_oldest").isoformat() == "2026-08-01T16:21:50", reach)
+    check("one search per track, one time query",
+          len(posts) == 1, f"{len(posts)} POSTs")
+
+    # Mehrere Kanaele: der aelteste gewinnt, egal in welcher Reihenfolge.
+    search_mode["starts"] = {"201": "2026-07-30T08:00:00Z"}
+    reach = co._fetch_recording_reach_sync(session, host, [101, 201, 301])
+    check("the oldest track wins across channels",
+          reach.get("recording_oldest").isoformat() == "2026-07-30T08:00:00"
+          and reach.get("recording_tracks_measured") == 3, reach)
+    search_mode["starts"] = {}
+
+    # Ein Kanal ohne Aufnahmen darf die Messung nicht kippen.
+    search_mode["stumm"] = {"201"}
+    reach = co._fetch_recording_reach_sync(session, host, [101, 201])
+    check("a track without recordings does not break the measurement",
+          reach.get("recording_reach_days") == 14.96
+          and reach.get("recording_tracks_measured") == 1, reach)
+    search_mode["stumm"] = set()
+
+    # EICHUNG in die andere Richtung: antwortet gar kein Kanal, kommt kein
+    # erfundener Wert zurueck, sondern nichts.
+    search_mode["on"] = "leer"
+    check("no recordings at all yields no value",
+          co._fetch_recording_reach_sync(session, host, [101, 201]) == {})
+    search_mode["on"] = "kaputt"
+    check("a failing search yields no value, not a guess",
+          co._fetch_recording_reach_sync(session, host, [101]) == {})
+    check("a failing search is not mistaken for a capability",
+          co._probe_recording_search(session, host, [1]) is False)
+    search_mode["on"] = "normal"
 
     # --- full fetch ---------------------------------------------------------
     data = co._fetch_all_sync(session, host, caps)

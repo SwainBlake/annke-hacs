@@ -10,6 +10,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import PERCENTAGE, UnitOfInformation, UnitOfTime
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN, RTSP_PORT
 from .coordinator import AnnkeCoordinator
@@ -36,6 +37,11 @@ async def async_setup_entry(
             HddFreeSensor(coordinator),
             HddUsedPctSensor(coordinator),
             HddStatusSensor(coordinator),
+        ]
+    if nvr_caps.get("recording_search"):
+        entities += [
+            RecordingReachSensor(coordinator),
+            RecordingOldestSensor(coordinator),
         ]
     if nvr_caps.get("streaming_status"):
         entities.append(RtspSessionsSensor(coordinator))
@@ -170,6 +176,64 @@ class RtspSessionsSensor(_NvrSensor):
 
     @property
     def native_value(self): return self._nvr.get("rtsp_sessions", 0)
+
+
+class RecordingReachSensor(_NvrSensor):
+    """How far back the ring buffer still reaches, in days.
+
+    Gemessen, nicht gerechnet: der Wert kommt aus dem aeltesten Segment, das
+    die Aufzeichnungssuche des Rekorders noch findet. Eine Rechnung aus
+    Kapazitaet und Schreibrate haette am 2026-08-16 24,5 Tage ergeben,
+    tatsaechlich waren es 15,0.
+    """
+
+    _attr_name = "Recording Reach"
+    _attr_native_unit_of_measurement = UnitOfTime.DAYS
+    _attr_device_class = SensorDeviceClass.DURATION
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:history"
+
+    def __init__(self, c): super().__init__(c, "recording_reach_days")
+
+    @property
+    def native_value(self): return self._nvr.get("recording_reach_days")
+
+    @property
+    def extra_state_attributes(self):
+        nvr = self._nvr
+        aeltestes = nvr.get("recording_oldest")
+        jetzt = nvr.get("recording_nvr_time")
+        return {
+            "quelle": "ISAPI /ContentMgmt/search, aeltestes Segment",
+            "gemessen_nicht_gerechnet": True,
+            "aeltestes_segment_geraetezeit": aeltestes.isoformat() if aeltestes else None,
+            "nvr_zeit_bei_der_messung": jetzt.isoformat() if jetzt else None,
+            "kanaele_mit_treffer": nvr.get("recording_tracks_measured"),
+        }
+
+
+class RecordingOldestSensor(_NvrSensor):
+    """Timestamp of the oldest recording still on disk.
+
+    Der Rekorder liefert seine Zeiten als Wanduhr mit einem Versatz, der bei
+    Sommerzeit falsch ist (gemessen am 2026-08-16: er meldete +01:00 bei einer
+    Uhr auf +02:00). Deshalb wird die Wanduhr des Geraets mit der Zeitzone von
+    Home Assistant versehen. Das Attribut ``nvr_zeit_bei_der_messung`` des
+    Reichweitensensors macht ein Auseinanderlaufen beider Uhren sichtbar.
+    """
+
+    _attr_name = "Oldest Recording"
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_icon = "mdi:clock-start"
+
+    def __init__(self, c): super().__init__(c, "recording_oldest")
+
+    @property
+    def native_value(self):
+        aeltestes = self._nvr.get("recording_oldest")
+        if aeltestes is None:
+            return None
+        return aeltestes.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE)
 
 
 class IpAddressSensor(_NvrSensor):

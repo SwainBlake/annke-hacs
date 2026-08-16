@@ -1,7 +1,7 @@
 {
   "domain": "annke",
   "name": "Annke",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "config_flow": true,
   "documentation": "https://github.com/SwainBlake/annke-hacs",
   "requirements": [],

@@ -65,6 +65,28 @@ The integration connects to the ISAPI alert stream and pushes events to HA with 
 | `sensor` Active RTSP Sessions | count |
 | `sensor` IP Address | with RTSP URL template |
 | `sensor` MAC Address | — |
+| `sensor` Recording Reach | days the ring buffer still reaches back |
+| `sensor` Oldest Recording | timestamp of the oldest segment on disk |
+
+#### Recording Reach: measured, not calculated
+
+An NVR disk sits at 100 % used forever — that is what a ring buffer does, and it
+says nothing about how far back you can still go after an incident. These two
+sensors ask the recorder itself (`POST /ISAPI/ContentMgmt/search`, one search per
+channel) for the oldest segment still on disk.
+
+They are refreshed every 15 minutes, not on the 30-second poll: the value moves
+by minutes per hour, and the device allows only one concurrent search
+(`maxConcurrentSearches` 1 in `/ISAPI/ContentMgmt/search/profile`). One search
+costs about one kilobyte.
+
+Do not replace this with capacity ÷ write rate. On the reference device that
+calculation was off by 63 %: 3.815 TB ÷ 156 GB/day suggests 24.5 days while the
+recorder actually held 15.0 days, because the disk runs in `quota` work mode and
+does not hand the whole disk to video.
+
+If the device does not answer the search, both sensors are simply not created.
+No estimate is substituted.
 
 ### Master switches (NVR device)
 - All Push Notifications (all channels at once)

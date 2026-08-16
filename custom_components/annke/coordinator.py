@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import logging
+import re
 import socket
 import threading
-from datetime import timedelta
+import time
+from datetime import datetime, timedelta
 from xml.etree import ElementTree as ET
 
 import requests
@@ -18,6 +20,10 @@ from .const import (
     EVENT_TYPE_KEY,
     NS_ISAPI,
     NS_STD,
+    RECORDING_REACH_INTERVAL,
+    RECORDING_SEARCH_EPOCH,
+    RECORDING_SEARCH_PATH,
+    RECORDING_TIME_PATH,
     SCAN_INTERVAL,
     SMART_ENDPOINT,
     SMART_FEATURES,
@@ -64,6 +70,114 @@ def _put(session, host, path, root, ns):
         timeout=10,
     )
     r.raise_for_status()
+
+
+# ---------------------------------------------------------------------------
+# Recording reach: how far back does the ring buffer go?
+# ---------------------------------------------------------------------------
+
+# Die Suchbeschreibung, die /ISAPI/ContentMgmt/search/description selbst
+# verlangt ("inboundData: CMSearchDescription"). maxResults 1 reicht: das erste
+# Ergebnis ist das aelteste Segment, und die Antwort bleibt unter einem
+# Kilobyte.
+_SEARCH_BODY = (
+    '<?xml version="1.0" encoding="UTF-8"?>\n'
+    '<CMSearchDescription version="1.0" xmlns="%s">\n'
+    "<searchID>{%s}</searchID>\n"
+    "<trackIDList><trackID>%s</trackID></trackIDList>\n"
+    "<timeSpanList><timeSpan>"
+    "<startTime>%s</startTime><endTime>%s</endTime>"
+    "</timeSpan></timeSpanList>\n"
+    "<maxResults>1</maxResults>\n"
+    "<searchResultPosition>0</searchResultPosition>\n"
+    "<metadataList><metadataDescriptor>//recordType.meta.std-cgi.com/"
+    "</metadataDescriptor></metadataList>\n"
+    "</CMSearchDescription>\n"
+)
+
+_WALL_CLOCK = re.compile(r"(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})")
+
+
+def _wall_clock(text: str) -> datetime:
+    """Read the recorder's wall clock, deliberately ignoring its UTC offset.
+
+    Der Rekorder gibt bei Sommerzeit einen falschen Versatz aus: gemessen am
+    2026-08-16 meldete er ``2026-08-16T15:25:42+01:00``, waehrend seine Uhr
+    tatsaechlich auf mitteleuropaeischer Sommerzeit (+02:00) lief. Die Uhrzeit
+    selbst stimmte auf zwei Sekunden mit dem Host ueberein.
+
+    Deshalb wird nur die Wanduhr gelesen und Geraet gegen Geraet verglichen:
+    aeltestes Segment gegen Gegenwart, beide vom selben Rekorder. Die Differenz
+    ist dann unabhaengig davon richtig, ob der Versatz stimmt.
+    """
+    m = _WALL_CLOCK.search(text or "")
+    if not m:
+        raise ValueError(f"keine Zeitangabe in {text!r}")
+    return datetime.strptime(f"{m.group(1)}T{m.group(2)}", "%Y-%m-%dT%H:%M:%S")
+
+
+def _search_oldest_segment(session, host: str, track: int, now: datetime):
+    """Return the start of the oldest segment still on disk for one track."""
+    ende = (now + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    body = _SEARCH_BODY % (
+        NS_STD,
+        f"c7c43a1e-b8e0-4a2c-9c1c-{track:012d}",
+        track,
+        RECORDING_SEARCH_EPOCH,
+        ende,
+    )
+    r = session.post(
+        f"http://{host}{RECORDING_SEARCH_PATH}",
+        data=body.encode("utf-8"),
+        headers={"Content-Type": "application/xml"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    root = ET.fromstring(r.text)
+    item = root.find(f".//{{{NS_STD}}}searchMatchItem")
+    if item is None:
+        return None
+    span = item.find(f"{{{NS_STD}}}timeSpan")
+    start = _text(span, "startTime", NS_STD)
+    return _wall_clock(start) if start else None
+
+
+def _fetch_recording_reach_sync(session, host: str, tracks: list[int]) -> dict:
+    """How many days back do the recordings go, measured on the device.
+
+    Bewusst keine Rechnung aus Kapazitaet und Schreibrate. Die waere am
+    2026-08-16 um 63 Prozent danebengelegen: 3,815 TB geteilt durch 156 GB am
+    Tag ergibt 24,5 Tage, tatsaechlich reichten die Aufnahmen 15,0 Tage
+    zurueck. Ursache ist der Betriebsmodus ``quota``, der nicht die ganze
+    Platte fuer Video freigibt.
+    """
+    r = session.get(f"http://{host}{RECORDING_TIME_PATH}", timeout=10)
+    r.raise_for_status()
+    jetzt = _wall_clock(r.text)
+
+    aeltestes = None
+    gemessene_tracks = 0
+    for track in tracks:
+        try:
+            start = _search_oldest_segment(session, host, track, jetzt)
+        except Exception as exc:  # ein stummer Kanal darf den Rest nicht kippen
+            _LOGGER.debug("Recording search failed for track %s: %s", track, exc)
+            continue
+        if start is None:
+            continue
+        gemessene_tracks += 1
+        if aeltestes is None or start < aeltestes:
+            aeltestes = start
+
+    if aeltestes is None:
+        return {}
+
+    return {
+        "recording_oldest": aeltestes,
+        "recording_reach_days": round((jetzt - aeltestes).total_seconds() / 86400, 2),
+        "recording_tracks_measured": gemessene_tracks,
+        "recording_nvr_time": jetzt,
+    }
 
 
 def _has_notification(root, method: str) -> bool:
@@ -131,9 +245,42 @@ def _probe_capabilities_sync(session, host: str) -> dict:
         "streaming_status": probe("/ISAPI/Streaming/status"),
         "network":          probe("/ISAPI/System/Network/interfaces"),
         "input_proxy":      probe("/ISAPI/ContentMgmt/InputProxy/channels"),
+        # Die Aufzeichnungssuche wird nicht am Statuscode allein gemessen: das
+        # Geraet antwortet auf manche nicht unterstuetzte Anfrage mit 200 und
+        # einer Fehlerhuelle. Deshalb muss ein CMSearchResult zurueckkommen,
+        # und die Zeitquelle muss ebenfalls lesbar sein, sonst laesst sich aus
+        # dem aeltesten Segment keine Reichweite bilden.
+        "recording_search": (
+            probe(RECORDING_TIME_PATH)
+            and _probe_recording_search(session, host, channels)
+        ),
     }
 
     return {"channels": channels, "channel_caps": channel_caps, "nvr_caps": nvr_caps}
+
+
+def _probe_recording_search(session, host: str, channels: list[int]) -> bool:
+    """True only if a real search result comes back for at least one track."""
+    for ch in channels:
+        try:
+            body = _SEARCH_BODY % (
+                NS_STD,
+                f"c7c43a1e-b8e0-4a2c-9c1c-{ch * 100 + 1:012d}",
+                ch * 100 + 1,
+                RECORDING_SEARCH_EPOCH,
+                "2038-01-01T00:00:00Z",
+            )
+            r = session.post(
+                f"http://{host}{RECORDING_SEARCH_PATH}",
+                data=body.encode("utf-8"),
+                headers={"Content-Type": "application/xml"},
+                timeout=15,
+            )
+            if r.status_code == 200 and "CMSearchResult" in r.text:
+                return True
+        except Exception:
+            continue
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -502,6 +649,9 @@ class AnnkeCoordinator(DataUpdateCoordinator):
         self._alert_response = None
         self._alert_response_lock = threading.Lock()
         self._alert_listeners: list = []
+        # Reichweite des Ringpuffers: eigener, langsamer Takt (siehe const.py).
+        self._reach: dict = {}
+        self._reach_at: float = 0.0
 
         # One session for polling and writes, a separate one for the alert
         # stream. Reusing a session keeps the digest handshake and the TCP
@@ -640,11 +790,40 @@ class AnnkeCoordinator(DataUpdateCoordinator):
 
     async def _async_update_data(self) -> dict:
         try:
-            return await self.hass.async_add_executor_job(
+            data = await self.hass.async_add_executor_job(
                 _fetch_all_sync, self.session, self.host, self.capabilities
             )
         except Exception as err:
             raise UpdateFailed(f"Error communicating with device: {err}") from err
+
+        data["nvr"].update(await self._async_recording_reach())
+        return data
+
+    async def _async_recording_reach(self) -> dict:
+        """Ring buffer reach, refreshed on its own slow schedule.
+
+        Ein Fehlschlag der Suche darf die uebrigen 118 Entitaeten nicht
+        umwerfen, deshalb faengt diese Ebene alles ab und behaelt im Zweifel
+        den letzten gemessenen Wert.
+        """
+        if not self.capabilities.get("nvr_caps", {}).get("recording_search"):
+            return {}
+        if self._reach and time.monotonic() - self._reach_at < RECORDING_REACH_INTERVAL:
+            return self._reach
+
+        tracks = [ch * 100 + 1 for ch in self.capabilities.get("channels", [])]
+        try:
+            neu = await self.hass.async_add_executor_job(
+                _fetch_recording_reach_sync, self.session, self.host, tracks
+            )
+        except Exception as exc:
+            _LOGGER.debug("Recording reach not updated: %s", exc)
+            return self._reach
+
+        if neu:
+            self._reach = neu
+            self._reach_at = time.monotonic()
+        return self._reach
 
     async def _call(self, fn, *args):
         await self.hass.async_add_executor_job(fn, self.session, self.host, *args)
